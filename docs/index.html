@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="An experimental pip-installable build of CMS Higgs Combine v11 backed by the ROOT Python wheel."
+    >
+    <title>higgs-combine-tool</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="hero">
+      <nav aria-label="Primary navigation">
+        <a class="wordmark" href="#top">higgs-combine-tool</a>
+        <div class="nav-links">
+          <a href="#install">Install</a>
+          <a href="#scope">Scope</a>
+          <a href="https://github.com/DickyChant/combine_pypi">GitHub</a>
+        </div>
+      </nav>
+
+      <main id="top" class="hero-grid">
+        <section>
+          <p class="eyebrow">CMS Combine v11 · experimental packaging</p>
+          <h1>Statistical inference,<br><span>one virtualenv away.</span></h1>
+          <p class="lede">
+            A proof of concept that packages the CMS Higgs Combine executable,
+            Python tools, and runtime data around the official ROOT wheel.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="#install">Installation routes</a>
+            <a class="button secondary" href="https://github.com/DickyChant/combine_pypi/actions">CI wheel artifacts</a>
+          </div>
+          <p class="caveat">Unofficial, alpha-stage, Linux x86-64 only. Not a replacement for CMSSW production environments.</p>
+        </section>
+
+        <aside class="terminal" aria-label="Example Combine session">
+          <div class="terminal-bar"><i></i><i></i><i></i><span>virtualenv</span></div>
+          <pre><code><b>$</b> python -m pip install \
+  ./higgs_combine_tool-11.0.0-*.whl
+
+<b>$</b> text2workspace.py card.txt -o ws.root
+<b>$</b> combine -M AsymptoticLimits ws.root \
+  -t -1 --run blind
+
+<em>&lt;&lt;&lt; Combine &gt;&gt;&gt;</em>
+<em>&lt;&lt;&lt; v11.0.0 &gt;&gt;&gt;</em>
+Expected 50.0%: r &lt; 1.5508</code></pre>
+        </aside>
+      </main>
+    </header>
+
+    <section class="facts" aria-label="Compatibility summary">
+      <div><strong>11.0.0</strong><span>Combine</span></div>
+      <div><strong>6.40.00</strong><span>ROOT</span></div>
+      <div><strong>3.10–3.14</strong><span>Python</span></div>
+      <div><strong>manylinux 2.28</strong><span>CI target</span></div>
+    </section>
+
+    <section id="install" class="content-section">
+      <p class="eyebrow">Choose a route</p>
+      <h2>Install without a PyPI release.</h2>
+      <div class="cards">
+        <article>
+          <span class="number">01</span>
+          <h3>CI-built wheel</h3>
+          <p>Download <code>higgs-combine-tool-wheel</code> from a successful Actions run. This is the quickest path.</p>
+          <pre><code>python -m pip install \
+  ./higgs_combine_tool-11.0.0-*.whl</code></pre>
+        </article>
+
+        <article>
+          <span class="number">02</span>
+          <h3>Editable checkout</h3>
+          <p>Use this for packaging development after installing Boost and Eigen headers.</p>
+          <pre><code>python -m virtualenv .venv
+source .venv/bin/activate
+python -m pip install -e .</code></pre>
+        </article>
+
+        <article>
+          <span class="number">03</span>
+          <h3>Direct from GitHub</h3>
+          <p>Let pip clone and compile the current default branch. Native build headers are still required.</p>
+          <pre><code>python -m pip install \
+  "git+https://github.com/DickyChant/\
+combine_pypi.git"</code></pre>
+        </article>
+      </div>
+    </section>
+
+    <section id="scope" class="content-section split">
+      <div>
+        <p class="eyebrow">What is included</p>
+        <h2>A focused standalone build.</h2>
+      </div>
+      <ul class="check-list">
+        <li>Native <code>combine</code> executable and shared library</li>
+        <li><code>text2workspace.py</code> and the standard Python tools</li>
+        <li>Runtime model tables and CMSSW-compatible paths</li>
+        <li>Blind-fit smoke tests on Python 3.10 and 3.14</li>
+      </ul>
+      <ul class="limit-list">
+        <li>No PyPI publication</li>
+        <li>No CMSSW, CRAB, or CombineHarvester integration</li>
+        <li>No production-readiness claim for the alpha ROOT wheel</li>
+        <li>No Linux architectures beyond x86-64 yet</li>
+      </ul>
+    </section>
+
+    <footer>
+      <p>Packaging experiment for <a href="https://cms-analysis.github.io/HiggsAnalysis-CombinedLimit/v11.0.0/">CMS Higgs Combine v11.0.0</a>.</p>
+      <a href="https://github.com/DickyChant/combine_pypi/blob/main/README.md">Read the technical notes →</a>
+    </footer>
+  </body>
+</html>

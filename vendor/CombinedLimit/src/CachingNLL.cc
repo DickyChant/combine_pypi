@@ -1,0 +1,1291 @@
+#include "../interface/CachingNLL.h"
+#include "../interface/utils.h"
+#include "../interface/FnTimer.h"
+#include <stdexcept>
+#include <RooCategory.h>
+#include <RooDataSet.h>
+#include <RooProduct.h>
+#include <RooStats/RooStatsUtils.h>
+
+#include "../interface/ProfilingTools.h"
+#include "../interface/RooMultiPdfCombine.h"
+#include "../interface/VerticalInterpHistPdf.h"
+#include "../interface/CMSHistV.h"
+#include "../interface/CMSHistFunc.h"
+#include "../interface/CMSHistErrorPropagator.h"
+#include "../interface/CMSHistSum.h"
+#include "../interface/CMSHistFuncWrapper.h"
+#include "../interface/VectorizedGaussian.h"
+#include "../interface/VectorizedCB.h"
+#include "../interface/VectorizedSimplePdfs.h"
+#include "../interface/VectorizedHistFactoryPdfs.h"
+#include "../interface/CachingMultiPdf.h"
+#include "../interface/RooCheapProduct.h"
+#include "../interface/Accumulators.h"
+#include "../interface/CombineLogger.h"
+#include "vectorized.h"
+
+namespace cacheutils {
+    typedef OptimizedCachingPdfT<FastVerticalInterpHistPdf,FastVerticalInterpHistPdfV> CachingHistPdf;
+    typedef OptimizedCachingPdfT<FastVerticalInterpHistPdf2,FastVerticalInterpHistPdf2V> CachingHistPdf2;
+    typedef OptimizedCachingPdfT<CMSHistFunc, CMSHistV<CMSHistFunc>> CachingCMSHistFunc;
+    typedef OptimizedCachingPdfT<CMSHistFuncWrapper, CMSHistV<CMSHistFuncWrapper>> CachingCMSHistFuncWrapper;
+    typedef OptimizedCachingPdfT<CMSHistErrorPropagator, CMSHistV<CMSHistErrorPropagator>> CachingCMSHistErrorPropagator;
+    typedef OptimizedCachingPdfT<CMSHistSum, CMSHistV<CMSHistSum>> CachingCMSHistSum;
+    typedef OptimizedCachingPdfT<RooGaussian,VectorizedGaussian> CachingGaussPdf;
+    typedef OptimizedCachingPdfT<RooCBShape,VectorizedCBShape> CachingCBPdf;
+    typedef OptimizedCachingPdfT<RooExponential,VectorizedExponential> CachingExpoPdf;
+    typedef OptimizedCachingPdfT<RooPower,VectorizedPower> CachingPowerPdf;
+
+    class ReminderSum : public RooAbsReal {
+        public:
+            ReminderSum() {}
+            ReminderSum(const char *name, const char *title, const RooArgList& sumSet) ;
+            ReminderSum(const ReminderSum &other, const char* name = 0) :
+                RooAbsReal(other, name),
+                list_("deps",this,other.list_),
+                terms_(other.terms_) {} 
+            ~ReminderSum() override {}
+            TObject* clone(const char* newname) const override { return new ReminderSum(*this,newname); }
+        private:
+            RooListProxy list_;
+            std::vector<const RooAbsReal *> terms_;
+            Double_t evaluate() const override;
+    };
+}
+
+//---- Uncomment this to get a '.' printed every some evals
+//#define TRACE_NLL_EVALS
+
+//---- Uncomment this to get a total of the evals done
+//#define TRACE_NLL_EVAL_COUNT
+
+//---- Uncomment this and run with --perfCounters to get cache statistics
+// #define DEBUG_CACHE
+
+//---- Uncomment to dump PDF values inside CachingAddNLL
+//#define LOG_ADDPDFS
+
+#include "../interface/ProfilingTools.h"
+
+//std::map<std::string,double> cacheutils::CachingAddNLL::offsets_;
+bool cacheutils::CachingSimNLL::noDeepLEE_ = false;
+bool cacheutils::CachingSimNLL::hasError_  = false;
+bool cacheutils::CachingSimNLL::optimizeContraints_  = true;
+
+//#define DEBUG_TRACE_POINTS
+#ifdef DEBUG_TRACE_POINTS
+namespace { 
+    template<unsigned int>
+    void tracePoint(const RooAbsCollection &point) {
+        static const RooAbsCollection *lastPoint = 0;
+        static std::vector<double> values;
+        if (&point != lastPoint) {
+            std::cout << "Arrived in a completely new point. " << std::endl;
+            values.resize(point.getSize());
+            RooLinkedListIter iter = point.iterator();
+            for (RooAbsArg *a  = (RooAbsArg*)(iter.Next()); a != 0; a  = (RooAbsArg*)(iter.Next())) {
+                RooRealVar *rrv = dynamic_cast<RooRealVar *>(a); if (!rrv) continue;
+                values.push_back(rrv->getVal());
+            }
+            lastPoint = &point;
+        } else {
+            std::cout << "Moved: ";
+            RooLinkedListIter iter = point.iterator();
+            int i = 0;
+            for (RooAbsArg *a  = (RooAbsArg*)(iter.Next()); a != 0; a  = (RooAbsArg*)(iter.Next())) {
+                RooRealVar *rrv = dynamic_cast<RooRealVar *>(a); if (!rrv) continue;
+                if (values[i] != rrv->getVal()) std::cout << a->GetName() << " " << values[i] << " => " << rrv->getVal() << "    "; 
+                values[i++] = rrv->getVal();
+            }
+            std::cout << std::endl;
+        }
+    }
+}
+#define TRACE_POINT2(x,i)  ::tracePoint<i>(x);
+#define TRACE_POINT(x)  ::tracePoint<0>(x);
+#define TRACE_NLL(x)    std::cout << x << std::endl;
+#else
+#define TRACE_POINT2(x,i)
+#define TRACE_POINT(x) 
+#define TRACE_NLL(x) 
+#endif
+
+#ifdef TRACE_NLL_EVAL_COUNT
+namespace { unsigned long CachingSimNLLEvalCount = 0; }
+#endif
+
+cacheutils::ArgSetChecker::ArgSetChecker(const RooAbsCollection &set) 
+{
+    for (RooAbsArg *a : set) {
+        RooRealVar *rrv = dynamic_cast<RooRealVar *>(a);
+        if (rrv) { // && !rrv->isConstant()) { 
+            vars_.push_back(rrv);
+            vals_.push_back(rrv->getVal());
+            continue;
+        }
+        RooCategory *cat =  dynamic_cast<RooCategory *>(a);
+        if (cat) {
+            cats_.push_back(cat);
+            states_.push_back(cat->getIndex()); 
+        }
+    }
+}
+
+bool cacheutils::ArgSetChecker::changed(bool updateIfChanged) {
+    bool changed = false;
+    for (std::size_t i = 0; i < vars_.size(); ++i) {
+        double val = vars_[i]->getVal();
+        if (val != vals_[i]) {
+            changed = true;
+            if (updateIfChanged) { vals_[i] = val; }
+            else break;
+        }
+    }
+    for (std::size_t i = 0; i < cats_.size(); ++i) {
+        int val = cats_[i]->getIndex();
+        if (val != states_[i]) {
+            changed = true;
+            if (updateIfChanged) { states_[i] = val; }
+            else break;
+        }
+    }
+
+    return changed;
+}
+
+cacheutils::ValuesCache::ValuesCache(const RooAbsCollection &params, int size) :
+    size_(1),
+    maxSize_(size),
+    directMode_(false)
+{
+    assert(size <= MaxItems_);
+    items[0] = new Item(params);
+}
+cacheutils::ValuesCache::ValuesCache(const RooAbsReal &pdf, const RooArgSet &obs, int size) :
+    size_(1),
+    maxSize_(size),
+    directMode_(false)
+{
+    assert(size <= MaxItems_);
+    std::unique_ptr<RooArgSet> params(pdf.getParameters(obs));
+    //std::cout << "Parameters for pdf " << pdf.GetName() << " (" << pdf.ClassName() << "):"; params->Print("");
+    items[0] = new Item(*params);
+}
+
+
+cacheutils::ValuesCache::~ValuesCache() 
+{
+    for (int i = 0; i < size_; ++i) delete items[i];
+}
+
+void cacheutils::ValuesCache::clear() 
+{
+    for (int i = 0; i < size_; ++i) items[i]->good = false;
+}
+
+std::pair<std::vector<Double_t> *, bool> cacheutils::ValuesCache::get() 
+{
+    if (directMode_) {
+        return std::pair<std::vector<Double_t> *, bool>(&items[0]->values, false);
+    }
+    int found = -1; bool good = false;
+    for (int i = 0; i < size_; ++i) {
+        if (items[i]->good) {
+            // valid entry, check if fresh
+            if (!items[i]->checker.changed()) {
+#ifdef DEBUG_CACHE
+                PerfCounter::add(i == 0 ? "ValuesCache::get hit first" : "ValuesCache::get hit other");
+#endif
+                // fresh: done! 
+                found = i; 
+                good = true; 
+                break;
+            } 
+        } else if (found == -1) {
+            // invalid entry, can be replaced
+            found = i;
+#ifdef DEBUG_CACHE
+            PerfCounter::add("ValuesCache::get hit invalid");
+#endif
+        }
+    } 
+    if (found == -1) {
+        // all entries are valid but old 
+#ifdef DEBUG_CACHE
+        PerfCounter::add("ValuesCache::get miss");
+#endif
+        if (size_ < maxSize_) {
+            // if I can, make a new entry
+            items[size_] = new Item(items[0]->checker); // create a new item, copying the ArgSetChecker from the first one
+            found = size_; 
+            size_++;
+        } else {
+            // otherwise, pick the last one
+            found = size_-1;
+        }
+    }
+    // make sure new entry is the first one
+    if (found != 0) {
+        // remember what found is pointing to
+        Item *f = items[found];
+        // shift the other items down one place
+        while (found > 0) { items[found] = items[found-1]; --found; } 
+        // and put found on top
+        items[found] = f;
+    }
+    if (!good) items[found]->checker.changed(true); // store new values in cache sentry
+    items[found]->good = true;                      // mark this as valid entry
+    return std::pair<std::vector<Double_t> *, bool>(&items[found]->values, good);
+}
+
+cacheutils::CachingPdf::CachingPdf(RooAbsReal *pdf, const RooArgSet *obs)
+    : obs_(obs),
+      pdfOriginal_(pdf),
+      pdfPieces_(),
+      pdf_((runtimedef::get("CACHINGPDF_NOCLONE") &&
+            pdfOriginal_->getAttribute("CachingPdf_NoClone"))
+               ? pdfOriginal_
+               : (runtimedef::get("CACHINGPDF_NOCHEAPCLONE")
+                      ? utils::fullCloneFunc(pdfOriginal_, pdfPieces_)
+                      : utils::fullCloneFunc(pdfOriginal_, *obs_, pdfPieces_))),
+      cache_(*pdf_, *obs_) {
+  if (runtimedef::get("CACHINGPDF_DIRECT") || pdf->getAttribute("CachingPdf_Direct")) {
+    cache_.setDirectMode(true);
+  }
+}
+
+cacheutils::CachingPdf::CachingPdf(const CachingPdf &other)
+    : obs_(other.obs_),
+      pdfOriginal_(other.pdfOriginal_),
+      pdfPieces_(),
+      pdf_((runtimedef::get("CACHINGPDF_NOCLONE") &&
+            other.pdfOriginal_->getAttribute("CachingPdf_NoClone"))
+               ? pdfOriginal_
+               : (runtimedef::get("CACHINGPDF_NOCHEAPCLONE")
+                      ? utils::fullCloneFunc(pdfOriginal_, pdfPieces_)
+                      : utils::fullCloneFunc(pdfOriginal_, *obs_, pdfPieces_))),
+      cache_(*pdf_, *obs_),
+      includeZeroWeights_(other.includeZeroWeights_) {
+  if (runtimedef::get("CACHINGPDF_DIRECT") ||
+      other.pdfOriginal_->getAttribute("CachingPdf_Direct")) {
+    cache_.setDirectMode(true);
+  }
+}
+
+cacheutils::CachingPdf::~CachingPdf() 
+{
+}
+
+const std::vector<Double_t> & 
+cacheutils::CachingPdf::eval(const RooAbsData &data) 
+{
+#ifdef DEBUG_CACHE
+    PerfCounter::add("CachingPdf::eval called");
+#endif
+    bool newdata = (lastData_ != &data);
+    if (newdata) newData_(data);
+    std::pair<std::vector<Double_t> *, bool> hit = cache_.get();
+    if (!hit.second) { 
+        realFill_(data, *hit.first);
+    } 
+    return *hit.first;
+}
+
+void
+cacheutils::CachingPdf::newData_(const RooAbsData &data) 
+{
+    lastData_ = &data;
+    pdf_->optimizeCacheMode(*data.get());
+    pdf_->attachDataSet(data);
+    const_cast<RooAbsData*>(lastData_)->setDirtyProp(false);
+    cache_.clear();
+    nonZeroW_.resize(data.numEntries());
+    for (unsigned int i = 0, n = nonZeroW_.size(); i < n; ++i) {
+        data.get(i);
+        if (data.weight() > 0 || includeZeroWeights_) {
+            nonZeroW_[i] = 1; 
+        } else {
+            nonZeroW_[i] = 0;
+        }
+    }
+}
+
+
+void
+cacheutils::CachingPdf::realFill_(const RooAbsData &data, std::vector<Double_t> &vals) 
+{
+#ifdef DEBUG_CACHE
+    PerfCounter::add("CachingPdf::realFill_ called");
+#endif
+    //std::cout << "CachingPdf::realFill_ called for " << pdf_->GetName() << " (" << pdf_->ClassName() << ")\n";
+    //utils::printPdf((RooAbsPdf*)pdf_);
+    vals.resize(data.numEntries());
+    for (int i = 0; i < data.numEntries(); ++i) {
+        if (!nonZeroW_[i]) continue;
+        data.get(i);
+        vals[i] = pdf_->getVal(obs_);
+        TRACE_NLL("PDF value for " << pdf_->GetName() << " is " << vals[i] << " at this point.")
+        TRACE_POINT2(*obs_,1)
+    }
+}
+
+
+template <typename PdfT, typename VPdfT>
+void
+cacheutils::OptimizedCachingPdfT<PdfT,VPdfT>::newData_(const RooAbsData &data) 
+{
+    lastData_ = &data;
+    pdf_->optimizeCacheMode(*data.get());
+    pdf_->attachDataSet(data);
+    const_cast<RooAbsData*>(lastData_)->setDirtyProp(false);
+    cache_.clear();
+    delete vpdf_;
+    vpdf_ = new VPdfT(static_cast<const PdfT &>(*pdf_), data, includeZeroWeights_);
+}
+
+template <typename PdfT, typename VPdfT>
+void
+cacheutils::OptimizedCachingPdfT<PdfT,VPdfT>::realFill_(const RooAbsData &data, std::vector<Double_t> &vals) 
+{
+    vpdf_->fill(vals);
+}
+
+
+cacheutils::ReminderSum::ReminderSum(const char *name, const char *title, const RooArgList& sumSet) :
+    RooAbsReal(name,title),
+    list_("deps","",this)
+{
+    for (RooAbsArg * rar : sumSet) {
+        list_.add(*rar);
+        terms_.push_back(static_cast<RooAbsReal*>(rar));
+    }
+}
+Double_t cacheutils::ReminderSum::evaluate() const {
+    Double_t ret = 1.0;
+    for (auto x : terms_) ret -= x->getVal();
+    return ret;
+}
+
+cacheutils::CachingAddNLL::CachingAddNLL(const char *name, const char *title, RooAbsPdf *pdf, RooAbsData *data, bool includeZeroWeights) :
+    RooAbsReal(name, title),
+    pdf_(pdf),
+    params_("params","parameters",this),
+    catParams_("catParams","RooCategory parameters",this),
+    includeZeroWeights_(includeZeroWeights)
+{
+    if (pdf == 0) throw std::invalid_argument(std::string("Pdf passed to ")+name+" is null");
+    setData(*data);
+    setup_();
+    propagateData();
+    constantZeroPoint_ = -evaluate();
+}
+
+cacheutils::CachingAddNLL::CachingAddNLL(const CachingAddNLL &other, const char *name) :
+    RooAbsReal(name ? name : (TString("nll_")+other.pdf_->GetName()).Data(), ""),
+    pdf_(other.pdf_),
+    params_("params","parameters",this),
+    catParams_("catParams","RooCategory parameters",this),
+    includeZeroWeights_(other.includeZeroWeights_)
+{
+    setData(const_cast<RooAbsData &>(*other.data_));
+    setup_();
+    propagateData();
+    constantZeroPoint_ = -evaluate();
+}
+
+cacheutils::CachingAddNLL::~CachingAddNLL() 
+{
+    for (int i = 0, n = integrals_.size(); i < n; ++i) delete integrals_[i];
+    integrals_.clear();
+}
+
+cacheutils::CachingAddNLL *
+cacheutils::CachingAddNLL::clone(const char *name) const 
+{
+    return new cacheutils::CachingAddNLL(*this, name);
+}
+
+void cacheutils::CachingAddNLL::addPdfs_(RooAddPdf *addpdf, bool recursive, const RooArgList & basecoeffs)
+{
+    int npdf = addpdf->pdfList().getSize();
+    //std::cout << "Unpacking RooAddPdf " << addpdf->GetName() << " with " << npdf << " components:" << std::endl;
+    RooAbsReal *lastcoeff = 0;
+    if (npdf == addpdf->coefList().getSize()) {
+        lastcoeff =  dynamic_cast<RooAbsReal*>(addpdf->coefList().at(npdf-1));
+    } else {
+        prods_.emplace_back(new ReminderSum((std::string("reminder_of_")+addpdf->GetName()).c_str(),"", addpdf->coefList()));
+        lastcoeff = prods_.back().get();
+    }
+    //std::cout << "   Last coefficient is a " << lastcoeff->ClassName() << " aka " << typeid(*lastcoeff).name() << ": "; lastcoeff->Print("");
+    for (int i = 0; i < npdf; ++i) {
+        RooAbsReal * coeff = (i < npdf-1 ? dynamic_cast<RooAbsReal*>(addpdf->coefList().at(i)) : lastcoeff);
+        RooAbsPdf  * pdfi  = dynamic_cast<RooAbsPdf *>(addpdf->pdfList().at(i));
+        if (recursive && typeid(*pdfi) == typeid(RooAddPdf)) {
+            RooAddPdf *apdfi = static_cast<RooAddPdf*>(pdfi);
+            RooArgList list(*coeff);
+            if (basecoeffs.getSize()) list.add(basecoeffs);
+            //std::cout << "    Invoking recursive unpack on " << addpdf->GetName() << "[" << i << "]: RooAddPdf " << apdfi->GetName() << std::endl;
+            addPdfs_(apdfi, recursive, list);
+            continue;
+        } 
+        if (basecoeffs.getSize() == 0) {
+            coeffs_.push_back(coeff);
+        } else {
+            RooArgList list(*coeff);
+            list.add(basecoeffs);
+            prods_.emplace_back(new RooProduct((pdfi->GetName()+std::string("cachingnll")).c_str(),"",list));
+            coeffs_.push_back(prods_.back().get());
+            //std::cout << "Coefficient of " << pdfi->GetName() << std::endl; prods_.back().Print("");
+        }
+        const RooArgSet *obs = data_->get();
+        pdfs_.emplace_back(makeCachingPdf(pdfi,obs));
+        pdfs_.back()->setIncludeZeroWeights(includeZeroWeights_);
+        //std::cout << "    Adding " << addpdf->GetName() << "[" << i << "]: " << pdfi->ClassName() << " " << pdfi->GetName() << " using " << typeid(pdfs_.back()).name() << std::endl;
+    }
+}
+
+cacheutils::CachingPdfBase *
+cacheutils::makeCachingPdf(RooAbsReal *pdf, const RooArgSet *obs) {
+    static bool histNll  = runtimedef::get("ADDNLL_HISTNLL");
+    static bool gaussNll  = runtimedef::get("ADDNLL_GAUSSNLL");
+    static bool multiNll  = runtimedef::get("ADDNLL_MULTINLL");
+    static bool prodNll  = runtimedef::get("ADDNLL_PRODNLL");
+    static bool histfuncNll  = runtimedef::get("ADDNLL_HISTFUNCNLL");
+    static bool cbNll  = runtimedef::get("ADDNLL_CBNLL");
+    static bool hfNll  = runtimedef::get("ADDNLL_HFNLL");
+    static bool verb  = runtimedef::get("ADDNLL_VERBOSE_CACHING");
+
+    if (histNll && typeid(*pdf) == typeid(FastVerticalInterpHistPdf)) {
+        return new CachingHistPdf(pdf, obs);
+    } else if (histNll && typeid(*pdf) == typeid(FastVerticalInterpHistPdf2)) {
+        return new CachingHistPdf2(pdf, obs);
+    } else if (gaussNll && typeid(*pdf) == typeid(RooGaussian)) {
+        if (runtimedef::get("DBG_GAUSS")) {
+            CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("Creating CachingGaussPdf for  %s",pdf->GetName())),__func__);
+            pdf->Print("v");
+        }
+        return new CachingGaussPdf(pdf, obs);
+    } else if (cbNll && typeid(*pdf) == typeid(RooCBShape)) {
+        return new CachingCBPdf(pdf, obs);
+    } else if (gaussNll && typeid(*pdf) == typeid(RooExponential)) {
+	std::unique_ptr<RooArgSet> params(pdf->getParameters(obs));
+	if(params->getSize()!=1) {return new CachingPdf(pdf,obs);}
+        return new CachingExpoPdf(pdf, obs);
+    } else if (gaussNll && typeid(*pdf) == typeid(RooPower)) {
+        return new CachingPowerPdf(pdf, obs);
+    } else if (multiNll && typeid(*pdf) == typeid(RooMultiPdf)) {
+        return new CachingMultiPdf(static_cast<RooMultiPdf&>(*pdf), *obs);
+    } else if (multiNll && typeid(*pdf) == typeid(RooAddPdf)) {
+        return new CachingAddPdf(static_cast<RooAddPdf&>(*pdf), *obs);
+    } else if (prodNll && typeid(*pdf) == typeid(RooProduct)) {
+        return new CachingProduct(static_cast<RooProduct&>(*pdf), *obs);
+    } else if (hfNll && typeid(*pdf) == typeid(RooHistFunc)) {
+        //return new OptimizedCachingPdfT<RooHistFunc,VectorizedHistFunc>(pdf, obs);
+        return new VectorizedHistFunc(static_cast<RooHistFunc&>(*pdf));
+    } else if (hfNll && typeid(*pdf) == typeid(ParamHistFunc)) {
+        return new OptimizedCachingPdfT<ParamHistFunc,VectorizedParamHistFunc>(pdf, obs);
+    } else if (hfNll && typeid(*pdf) == typeid(PiecewiseInterpolation)) {
+        return new CachingPiecewiseInterpolation(static_cast<PiecewiseInterpolation&>(*pdf), *obs);
+    } else if (histfuncNll && typeid(*pdf) == typeid(CMSHistFunc)) {
+        return new CachingCMSHistFunc(pdf, obs);
+    } else if (histfuncNll && typeid(*pdf) == typeid(CMSHistFuncWrapper)) {
+        return new CachingCMSHistFuncWrapper(pdf, obs);
+    } else if (histfuncNll && typeid(*pdf) == typeid(CMSHistErrorPropagator)) {
+        return new CachingCMSHistErrorPropagator(pdf, obs);
+    } else if (histfuncNll && typeid(*pdf) == typeid(CMSHistSum)) {
+        return new CachingCMSHistSum(pdf, obs);
+    } else {
+        if (verb) {
+            CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("I don't have an optimized implementation for %s (%s)",pdf->ClassName(),pdf->GetName())),__func__);
+        }
+        return new CachingPdf(pdf, obs);
+    }
+
+}
+
+void
+cacheutils::CachingAddNLL::setup_() 
+{
+    fastExit_ = !runtimedef::get("NO_ADDNLL_FASTEXIT");
+    for (int i = 0, n = integrals_.size(); i < n; ++i) delete integrals_[i];
+    integrals_.clear(); pdfs_.clear(); coeffs_.clear(); prods_.clear();
+    RooAddPdf *addpdf = 0;
+    RooRealSumPdf *sumpdf = 0;
+    if ((addpdf = dynamic_cast<RooAddPdf *>(pdf_)) != 0) {
+        isRooRealSum_ = false; basicIntegrals_ = 0;
+        addPdfs_(addpdf, runtimedef::get("ADDNLL_RECURSIVE"), RooArgList());
+    } else if ((sumpdf = dynamic_cast<RooRealSumPdf *>(pdf_)) != 0) {
+        const RooArgSet *obs = data_->get();
+        isRooRealSum_ = true;  basicIntegrals_ = canBasicIntegrals_;
+        int npdf = sumpdf->coefList().getSize();
+        coeffs_.reserve(npdf);
+        pdfs_.reserve(npdf);
+        integrals_.reserve(npdf);
+        for (int i = 0; i < npdf; ++i) {
+            RooAbsReal * coeff = dynamic_cast<RooAbsReal*>(sumpdf->coefList().at(i));
+            RooAbsReal * funci = dynamic_cast<RooAbsReal*>(sumpdf->funcList().at(i));
+            static int tryfactor = runtimedef::get("ADDNLL_ROOREALSUM_FACTOR"); 
+            static int cheapprod = runtimedef::get("ADDNLL_ROOREALSUM_CHEAPPROD"); 
+            RooProduct *prodi = 0;
+            if (tryfactor && ((prodi = dynamic_cast<RooProduct *>(funci)) != 0)) {
+                RooArgList newcoeffs(*coeff), newfuncs; 
+                utils::factorizeFunc(*obs, *funci, newfuncs, newcoeffs);
+
+                if (newcoeffs.getSize() > 1) {
+                    if (cheapprod) prods_.emplace_back(new RooCheapProduct((funci->GetName()+std::string("_coeff_cachingnll")).c_str(),"",newcoeffs,runtimedef::get("ADDNLL_ROOREALSUM_PRUNECONST")));
+                    else           prods_.emplace_back(new RooProduct((funci->GetName()+std::string("_coeff_cachingnll")).c_str(),"",newcoeffs));
+                    coeff = prods_.back().get();
+                }
+                if (newfuncs.getSize() > 1) {
+                    //-- We don't make cheap products here since it does not implement the binning and analytical integrals
+                    //if (cheapprod) prods_.push_back(new RooCheapProduct("","",newfuncs));
+                    //else           prods_.push_back(new RooProduct("","",newfuncs));
+                    prods_.emplace_back(new RooProduct((funci->GetName()+std::string("_func_cachingnll")).c_str(),"",newfuncs));
+                    funci = prods_.back().get();
+                } else {
+                    funci =  dynamic_cast<RooAbsReal *>(newfuncs.first());
+                }
+            }
+            coeffs_.push_back(coeff);
+            pdfs_.emplace_back(makeCachingPdf(funci, obs));
+            pdfs_.back()->setIncludeZeroWeights(includeZeroWeights_);
+            integrals_.push_back(funci->createIntegral(*obs));
+        }
+    } else {
+        std::string errmsg = "ERROR: CachingAddNLL: Pdf ";
+        errmsg += pdf_->GetName();
+        errmsg += " is neither a RooAddPdf nor a RooRealSumPdf, but a ";
+        errmsg += pdf_->ClassName();
+        throw std::invalid_argument(errmsg);
+    }
+
+    std::unique_ptr<RooArgSet> params(pdf_->getParameters(*data_));
+    for (RooAbsArg *a : *params) {
+        if (dynamic_cast<RooRealVar *>(a))  params_.add(*a);
+        else if (dynamic_cast<RooCategory *>(a)) catParams_.add(*a);
+    }
+
+    multiPdfs_.clear();
+    for (auto &itp : pdfs_) {
+      if (auto* mpdf = dynamic_cast<const RooMultiPdf*>(itp->pdf())) {
+        multiPdfs_.emplace_back(mpdf, itp.get());
+      }
+      if (auto* hist = dynamic_cast<const CMSHistSum*>(itp->pdf())) {
+        histSums_.emplace_back(hist);
+      }
+      if (auto* hist = dynamic_cast<const CMSHistErrorPropagator*>(itp->pdf())) {
+        histErrorPropagators_.emplace_back(hist);
+      }
+    }
+}
+
+void
+cacheutils::CachingAddNLL::setIncludeZeroWeights(bool includeZeroWeights) 
+{
+    includeZeroWeights_ = includeZeroWeights;
+    for (auto &pdf : pdfs_) {
+        pdf->setIncludeZeroWeights(includeZeroWeights_);
+    }
+}
+
+Double_t 
+cacheutils::CachingAddNLL::evaluate() const 
+{
+#ifdef DEBUG_CACHE
+    PerfCounter::add("CachingAddNLL::evaluate called");
+#endif
+    // The very first thing we do before any evaluation: run the analytical
+    // minimization of Barlow-Beeston nuisance parameters.
+    const_cast<CachingAddNLL&>(*this).runAnalyticBarlowBeeston();
+
+    std::fill( partialSum_.begin(), partialSum_.end(), 0.0 );
+
+    double sumCoeff = 0;
+    bool allBasicIntegralsOk = (basicIntegrals_ == 1);
+    for (std::size_t i = 0; i < coeffs_.size(); ++i) {
+        // get coefficient
+        Double_t coeff = coeffs_[i]->getVal();
+        if (isRooRealSum_ && basicIntegrals_ < 2) {
+            sumCoeff += coeff * integrals_[i]->getVal();
+        } else {
+            sumCoeff += coeff;
+        }
+        // get vals
+        const std::vector<Double_t> &pdfvals = pdfs_[i]->eval(*data_);
+        if (basicIntegrals_) {
+            double integral = binWidths_.size() > 1 ?
+                                    vectorized::dot_product(pdfvals.size(), &pdfvals[0], &binWidths_[0]) :
+                                    binWidths_.front() * sumDefault<double>(pdfvals);
+            if (basicIntegrals_ == 1) {
+                double refintegral = integrals_[i]->getVal();
+                if (refintegral > 0) {
+                    if (std::abs((integral - refintegral)/refintegral) > 1e-5) {
+                        CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("integrals don't match: %+10.6f  %+10.6f  %10.7f %s\n", refintegral, integral, refintegral ? std::abs((integral - refintegral)/refintegral) : 0,  pdfs_[i]->pdf()->GetName()  )),__func__);
+                        allBasicIntegralsOk = false;
+                        basicIntegrals_ = 0; // don't waste time on this anymore
+                    }
+                }
+            } else {
+                sumCoeff += coeff*(integral - 1.0); // I had added up coeff before.
+            }
+        }
+#ifdef LOG_ADDPDFS
+        CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("%s coefficient %s (%s) = %20.15f\n", pdfs_[i]->pdf()->GetName(), coeffs[i]->GetName(), coeffs_[i]->ClassName(), coeff)),__func__);
+        for (unsigned int i = 0, n = pdfvals.size(); i < n; ++i) {
+            if (i%84==0) CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("%-80s[%3d] = %20.15f\n", pdfs_[i]->pdf()->GetName(), i, pdfvals[i])),__func__);
+        }
+#endif
+        // update running sum
+        //    std::vector<Double_t>::const_iterator itv = pdfvals.begin();
+        //    for (auto its = bgs; its != eds; ++its, ++itv) {
+        //         *its += coeff * (*itv); // sum (n_i * pdf_i)
+        //    }
+        // vectorize to make it faster
+        vectorized::mul_add(pdfvals.size(), coeff, pdfvals.data(), partialSum_.data());
+    }
+    // if all basic integrals evaluated ok, use them
+    if (allBasicIntegralsOk) basicIntegrals_ = 2;
+    // then get the final nll
+    static bool gentleNegativePenalty_ = runtimedef::get("GENTLE_LEE");
+    double ret = constantZeroPoint_;
+    if (runtimedef::get("REMOVE_CONSTANT_ZERO_POINT") ) ret = 0; 
+    for (std::size_t i = 0; i < partialSum_.size(); ++i) {
+        if (!std::isnormal(partialSum_[i]) || partialSum_[i] <= 0) {
+            if ((weights_[i] == 0) && (partialSum_[i] == 0)) {
+                // this special case we don't care, as zero is fine and it will be multiplied by zero afterwards,
+                // we just need to protect it for the logarithm
+                partialSum_[i] = 1.0; // arbitrary number, to avoid log(0)
+                continue;
+            } else if (weights_[i] == 0) {
+                // this is a special case we should in principle care, even if it does not alter the likelihood
+                // since it's multiplied by zero. However, normally RooFit ignores errors in zero-weight bins,
+                // so we comply to his policy (but we issue a warning, and we protect the logarithm)
+                static int nwarn = 0;
+                if (++nwarn < 100) {
+                    std::cout << "WARNING: underflow to " << partialSum_[i] << " in " << pdf_->GetName() << " for zero-entry bin " << i << std::endl;
+                }
+                partialSum_[i] = 1.0; // arbitrary number, to avoid bad logs
+                continue;
+            }
+            if (gentleNegativePenalty_ && std::abs(weights_[i]) < 1e-2) {
+              std::cout << "WARNING: gentle underflow to " << partialSum_[i] << " in " << pdf_->GetName() << " for bin "
+                        << i << ", weight " << weights_[i] << '\n';
+              partialSum_[i] = 1.0;  // skip the log
+              ret -= 25;   // add a penalty (negative since we flip 'ret' afterwards)
+              continue;
+            }
+            std::cout << "WARNING: underflow to " << partialSum_[i] << " in " << pdf_->GetName() << " for bin " << i << ", weight " << weights_[i] << std::endl; 
+            if (!CachingSimNLL::noDeepLEE_) logEvalError("Number of events is negative or error"); else CachingSimNLL::hasError_ = true;
+            if (fastExit_) { std::cout << "FASTEXIT from " << pdf_->GetName() << std::endl; return 9e9; }
+            else {
+              partialSum_[i] = 1;
+            }
+        }
+    }
+    // Do the reduction 
+    //      for ( its = bgs, itw = bgw ; its != eds ; ++its, ++itw ) {
+    //         ret -= (*itw) * log( ((*its) / sumCoeff) );
+    //      }
+    ret -= vectorized::nll_reduce(partialSum_.size(), partialSum_.data(), weights_.data(), sumCoeff, workingArea_.data());
+    // std::cout << "AddNLL for " << pdf_->GetName() << ": " << ret << std::endl;
+    // and add extended term: expected - observed*log(expected);
+    static bool expEventsNoNorm = runtimedef::get("ADDNLL_ROOREALSUM_NONORM");
+    double expectedEvents = (isRooRealSum_ && !expEventsNoNorm ? pdf_->getNorm(data_->get()) : sumCoeff);
+    if (expectedEvents <= 0) {
+        //std::cout << "WARNING: underflow in total event yield for " << pdf_->GetName() << ", expected yield = " << expectedEvents << " (observed: " << sumWeights_ << ")" << std::endl;
+    	CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("underflow (expected events <=0) in total event yield for %s, expected yield = %g (observed: %g)",pdf_->GetName(), expectedEvents, sumWeights_)),__func__);
+        if (!CachingSimNLL::noDeepLEE_) logEvalError("Expected number of events is negative"); else CachingSimNLL::hasError_ = true;
+        expectedEvents = 1e-6;
+    }
+    // I can add any arbitrary constant that does not depend on the expected events,
+    // so I choose it in order to minimize the number assuming that expectedEvents ~ sumWeights_
+    //    ret += expectedEvents - sumWeights_ * log(expectedEvents);
+    ret += (expectedEvents - sumWeights_)  - sumWeights_ * (log(expectedEvents) - (sumWeights_ ? log(sumWeights_) : 0));
+
+    // multipdfs want to add a correction factor to the NLL
+    if (!multiPdfs_.empty()) {
+        double correctionFactor = 0;
+        for (auto const& item : multiPdfs_) {
+            correctionFactor += item.first->getCorrection();
+        }
+        // Add correction 
+        ret += correctionFactor;
+    }
+
+    ret += zeroPoint_;
+
+    TRACE_NLL("AddNLL for " << pdf_->GetName() << ": " << ret)
+    return ret;
+}
+
+void
+cacheutils::CachingAddNLL::setZeroPoint()
+{
+    zeroPoint_ = 0.0;
+    double eval = evaluate();
+    zeroPoint_ = -eval; 
+    setValueDirty();
+}
+
+void
+cacheutils::CachingAddNLL::clearZeroPoint()
+{
+    zeroPoint_ = 0.0; 
+    setValueDirty();
+}
+
+void
+cacheutils::CachingAddNLL::clearConstantZeroPoint()
+{
+    constantZeroPoint_ = 0.0;
+    setValueDirty();
+}
+
+bool
+cacheutils::CachingAddNLL::setData(RooAbsData &data, bool cloneData)
+{
+    //std::cout << "Setting data for pdf " << pdf_->GetName() << std::endl;
+    //utils::printRAD(&data);
+    data_ = &data;
+    setValueDirty();
+    weights_.clear(); weights_.reserve(data.numEntries());
+    for (int i = 0, n = data.numEntries(); i < n; ++i) {
+        data.get(i);
+        double w = data.weight();
+        if (w || includeZeroWeights_) weights_.push_back(w); 
+    }
+    sumWeights_ = sumDefault(weights_);
+    partialSum_.resize(weights_.size());
+    workingArea_.resize(weights_.size());
+    for (auto & itp : pdfs_) {
+        itp->setDataDirty();
+    }
+    binWidths_.clear(); canBasicIntegrals_ = 0;
+    if (dynamic_cast<RooRealSumPdf *>(pdf_) != 0 && runtimedef::get("ADDNLL_ROOREALSUM_BASICINT") > 0) {
+        const RooArgSet *obs = data_->get();
+        RooRealVar *xvar = dynamic_cast<RooRealVar *>(obs->first());
+        if (obs->getSize() == 1 && xvar != 0 && xvar->numBins() == data_->numEntries()) {
+            const RooAbsBinning &bins = xvar->getBinning();
+            binWidths_.resize(xvar->numBins());
+            bool all_equal = true;
+            canBasicIntegrals_ = runtimedef::get("ADDNLL_ROOREALSUM_BASICINT");
+            for (unsigned int ibin = 0, nbin = binWidths_.size(); ibin < nbin; ++ibin) {
+                double bc = bins.binCenter(ibin), dc = data_->get(ibin)->getRealValue(xvar->GetName());
+                //printf("bin %3d: center %+8.5f ( data %+8.5f , diff %+8.5f ), width %8.5f, data weight %10.5f, channel %s\n", ibin, bc, dc, std::abs(dc-bc)/bins.binWidth(ibin), bins.binWidth(ibin), data_->weight(), pdf_->GetName());
+                binWidths_[ibin] = bins.binWidth(ibin);
+                if (std::abs(bc-dc) > 1e-5*binWidths_[ibin]) {
+                    //printf("channel %s, for observable %s, bin %d mismatch: binning %+8.5f ( data %+8.5f , diff %+7.8f of width %8.5f\n",
+                    //    pdf_->GetName(), xvar->GetName(), ibin, bc, dc, std::abs(bc-dc)/binWidths_[ibin], binWidths_[ibin]);
+                    CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("channel %s, for observable %s, bin %d mismatch: binning %+8.5f ( data %+8.5f , diff %+7.8f of width %8.5f",
+                            pdf_->GetName(), xvar->GetName(), ibin, bc, dc, std::abs(bc-dc)/binWidths_[ibin], binWidths_[ibin])),__func__);
+                    canBasicIntegrals_ = 0; 
+                    break;
+                }
+                if ((ibin > 0) && (binWidths_[ibin] != binWidths_[ibin-1])) all_equal = false;
+            }
+            if (all_equal) binWidths_.resize(1);
+        } else {
+            //printf("channel %s (binned likelihood? %d), can't do binned intergals. nobs %d, obs %s, nbins %d, ndata %d\n", pdf_->GetName(), pdf_->getAttribute("BinnedLikelihood"), obs->getSize(), (xvar ? xvar->GetName() : "<nil>"), (xvar ? xvar->numBins() : -999), data_->numEntries());
+            CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("channel %s (binned likelihood? %d), can't do binned intergals. nobs %d, obs %s, nbins %d, ndata %d"
+                    , pdf_->GetName(), pdf_->getAttribute("BinnedLikelihood"), obs->getSize(), (xvar ? xvar->GetName() : "<nil>"), (xvar ? xvar->numBins() : -999), data_->numEntries())),__func__);
+        }
+    }
+    propagateData();
+    return true;
+}
+
+void cacheutils::CachingAddNLL::propagateData() {
+  for (auto* hist : histErrorPropagators_) {
+    hist->setData(*data_);
+  }
+  for (auto* hist : histSums_) {
+    hist->setData(*data_);
+  }
+}
+
+void cacheutils::CachingAddNLL::setAnalyticBarlowBeeston(bool flag) {
+  for (auto* hist : histErrorPropagators_) {
+    hist->setAnalyticBarlowBeeston(flag);
+  }
+  for (auto* hist : histSums_) {
+    hist->setAnalyticBarlowBeeston(flag);
+  }
+}
+
+void cacheutils::CachingAddNLL::runAnalyticBarlowBeeston() {
+  for (auto* hist : histErrorPropagators_) {
+    hist->runBarlowBeeston();
+  }
+  for (auto* hist : histSums_) {
+    hist->runBarlowBeeston();
+  }
+}
+
+cacheutils::CachingSimNLL::CachingSimNLL(RooSimultaneous *pdf, RooAbsData *data, const RooArgSet *nuis) :
+    pdfOriginal_(pdf),
+    dataOriginal_(data),
+    nuis_(nuis),
+    params_("params","parameters",this),
+    catParams_("catParams","Category parameters",this)
+{
+    setup_();
+}
+
+cacheutils::CachingSimNLL::CachingSimNLL(const CachingSimNLL &other, const char *name) :
+    RooAbsReal{other, name},
+    pdfOriginal_(other.pdfOriginal_),
+    dataOriginal_(other.dataOriginal_),
+    nuis_(other.nuis_),
+    params_("params","parameters",this),
+    catParams_("catParams","Category parameters",this),
+    internalMasks_(other.internalMasks_),
+    maskingOffset_(other.maskingOffset_),
+    maskingOffsetZero_(other.maskingOffsetZero_)
+{
+    setup_();
+}
+
+cacheutils::CachingSimNLL *
+cacheutils::CachingSimNLL::clone(const char *name) const 
+{
+    return new cacheutils::CachingSimNLL(*this, name);
+}
+
+cacheutils::CachingSimNLL::~CachingSimNLL()
+{
+    constrainPdfGroups_.clear();
+    for (std::size_t i = 0; i < constrainPdfsFast_.size(); ++i) {
+        if (constrainPdfsFastOwned_[i]) { delete constrainPdfsFast_[i]; }
+    }
+    for (std::size_t i = 0; i < constrainPdfsFastPoisson_.size(); ++i) {
+        if (constrainPdfsFastPoissonOwned_[i]) { delete constrainPdfsFastPoisson_[i]; }
+    }
+    for (auto const& it : pdfs_) {
+        if (it) { delete it; }
+    }
+    #ifdef TRACE_NLL_EVAL_COUNT
+        std::cout << "CachingSimNLLEvalCount: " << ::CachingSimNLLEvalCount << std::endl;
+    #endif
+}
+
+void
+cacheutils::CachingSimNLL::setup_() 
+{
+    // Allow runtime-flag to switch off logEvalErrors
+    noDeepLEE_ = runtimedef::get("SIMNLL_NO_LEE");
+
+    //RooAbsPdf *pdfclone = runtimedef::get("SIMNLL_CLONE") ? pdfOriginal_  : utils::fullClonePdf(pdfOriginal_, piecesForCloning_);
+    RooAbsPdf *pdfclone = pdfOriginal_; // never clone
+
+    //---- Instead of getting the parameters here, we get them from the individual constraint terms and single pdfs ----
+    //---- This seems to save memory.
+    //std::unique_ptr<RooArgSet> params(pdfclone->getParameters(*dataOriginal_));
+    //params_.add(*params);
+    static bool verb  = runtimedef::get("ADDNLL_VERBOSE_CACHING");
+
+    RooArgList constraints;
+    factorizedPdf_.reset(dynamic_cast<RooSimultaneous *>(utils::factorizePdf(*dataOriginal_->get(), *pdfclone, constraints)));
+
+    RooSimultaneous *simpdf = factorizedPdf_.get();
+    constrainPdfs_.clear(); 
+    if (constraints.getSize()) {
+        int FastConstraints = optimizeContraints_ && runtimedef::get("SIMNLL_FASTGAUSS");
+        std::map<std::string,unsigned int> constraintsByType;
+        for (int i = 0, n = constraints.getSize(); i < n; ++i) {
+            RooAbsPdf *pdfi = dynamic_cast<RooAbsPdf*>(constraints.at(i));
+            constraintsByType[pdfi->ClassName()]++;
+            if (optimizeContraints_ && typeid(*pdfi) == typeid(SimpleGaussianConstraint)) {
+                constrainPdfsFast_.push_back(static_cast<SimpleGaussianConstraint *>(pdfi));
+                constrainPdfsFastOwned_.push_back(false);
+                constrainZeroPointsFast_.push_back(0);
+            } else if (optimizeContraints_ && typeid(*pdfi) == typeid(SimplePoissonConstraint)) {
+                constrainPdfsFastPoisson_.push_back(static_cast<SimplePoissonConstraint *>(pdfi));
+                constrainPdfsFastPoissonOwned_.push_back(false);
+                constrainZeroPointsFastPoisson_.push_back(0);
+            } else if (FastConstraints) {
+                if (typeid(*pdfi) == typeid(RooGaussian)) {
+                     RooAbsPdf *opt = SimpleGaussianConstraint::make(static_cast<RooGaussian&>(*pdfi));
+                     if (typeid(*opt) == typeid(SimpleGaussianConstraint)) {
+                         if (verb) std::cout << "Constraint " << pdfi->GetName() << " optimized into " << opt->ClassName() << std::endl;
+                         constrainPdfsFast_.push_back(static_cast<SimpleGaussianConstraint*>(opt));
+                         constrainPdfsFastOwned_.push_back(true);
+                         constrainZeroPointsFast_.push_back(0);
+                     } else {
+                         constrainPdfs_.push_back(pdfi);
+                         constrainZeroPoints_.push_back(0);
+                     }
+                } else if (typeid(*pdfi) == typeid(RooPoisson)) {
+                     RooAbsPdf *opt = SimplePoissonConstraint::make(static_cast<RooPoisson&>(*pdfi));
+                     if (typeid(*opt) == typeid(SimplePoissonConstraint)) {
+                         if (verb) std::cout << "Constraint " << pdfi->GetName() << " optimized into " << opt->ClassName() << std::endl;
+                         constrainPdfsFastPoisson_.push_back(static_cast<SimplePoissonConstraint*>(opt));
+                         constrainPdfsFastPoissonOwned_.push_back(true);
+                         constrainZeroPointsFastPoisson_.push_back(0);
+                     } else {
+                         constrainPdfs_.push_back(pdfi);
+                         constrainZeroPoints_.push_back(0);
+                     }
+                }
+            } else {
+                constrainPdfs_.push_back(pdfi);
+                constrainZeroPoints_.push_back(0);
+            }
+            //std::cout << "Constraint pdf: " << constraints.at(i)->GetName() << std::endl;
+            std::unique_ptr<RooArgSet> params(pdfi->getParameters(*dataOriginal_));
+            params_.add(*params, false);
+        }
+        if (verb) {
+	  for (const auto & p : constraintsByType) {
+            std::cout << "Constraints of type " << p.first << ": " << p.second << std::endl;
+          }
+	}
+        int GroupConstraints = std::min<int>(runtimedef::get("SIMNLL_GROUPCONSTRAINTS"), constrainPdfsFastPoisson_.size() + constrainPdfsFast_.size());
+        if (GroupConstraints > 1) {
+            std::cout << "Will create " << GroupConstraints << " groups for " << constrainPdfsFast_.size() << " + " << constrainPdfsFastPoisson_.size() << " constraints." << std::endl;
+            constrainPdfGroups_.resize(GroupConstraints);
+            int npois = constrainPdfsFastPoisson_.size(), ngaus = constrainPdfsFast_.size(), nitems = ngaus + npois;
+            int nPerGroup = (nitems + GroupConstraints - 1)/GroupConstraints;
+            int ig = 0, ng = 0;
+            for (auto *gaus : constrainPdfsFast_) {
+                constrainPdfGroups_[ig].add(gaus);
+                if (++ng == nPerGroup) { ++ig; ng = 0; }
+            }
+            for (auto *pois : constrainPdfsFastPoisson_) {
+                constrainPdfGroups_[ig].add(pois);
+                if (++ng == nPerGroup) { ++ig; ng = 0; }
+            }
+            for (const auto & cg : constrainPdfGroups_) {
+                std::cout << "ConstrainPdfGroup with " << cg.size() << " constraints." << std::endl;
+            }
+        }
+    } else {
+        std::cerr << "PDF didn't factorize!" << std::endl;
+        std::cout << "Parameters: " << std::endl;
+        std::unique_ptr<RooArgSet> params(pdfclone->getParameters(*dataOriginal_));
+        params->Print("V");
+        std::cout << "Obs: " << std::endl;
+        dataOriginal_->get()->Print("V");
+        factorizedPdf_.release();
+        simpdf = dynamic_cast<RooSimultaneous *>(pdfclone);
+    }
+
+
+    std::unique_ptr<RooAbsCategoryLValue> catClone((RooAbsCategoryLValue*) simpdf->indexCat().Clone());
+    pdfs_.resize(catClone->numBins(NULL), 0);
+    //dataSets_.reset(dataOriginal_->split(pdfOriginal_->indexCat(), true));
+    datasets_.resize(pdfs_.size(), 0);
+    splitWithWeights(*dataOriginal_, simpdf->indexCat(), true);
+    //std::cout << "Pdf " << simpdf->GetName() <<" is a SimPdf over category " << catClone->GetName() << ", with " << pdfs_.size() << " bins" << std::endl;
+    unsigned int nchannels = 0;
+    for (int ib = 0, nb = pdfs_.size(); ib < nb; ++ib) {
+        catClone->setBin(ib);
+        RooAbsPdf *pdf = simpdf->getPdf(catClone->getLabel());
+        if (pdf != 0) {
+            RooAbsData *data = (RooAbsData *) datasets_[ib]; //dataSets_->FindObject(catClone->getLabel());
+            //RooAbsData *data = (RooAbsData *) dataSets_->FindObject(catClone->getLabel());
+            //std::cout << "   bin " << ib << " (label " << catClone->getLabel() << ") has pdf " << pdf->GetName() << " of type " << pdf->ClassName() << " and " << (data ? data->numEntries() : -1) << " dataset entries" << std::endl;
+            if (data == 0) { throw std::logic_error("Error: no data"); }
+            bool includeZeroWeights = (runtimedef::get("ADDNLL_ROOREALSUM_BASICINT") && runtimedef::get("ADDNLL_ROOREALSUM_KEEPZEROS") && (dynamic_cast<RooRealSumPdf*>(pdf)!=0));
+            pdfs_[ib] = new CachingAddNLL(catClone->getLabel(), "", pdf, data, includeZeroWeights);
+            params_.add(pdfs_[ib]->params(), /*silent=*/true); 
+            catParams_.add(pdfs_[ib]->catParams(), /*silent=*/true); 
+            ++nchannels;
+        } else { 
+            pdfs_[ib] = 0; 
+            //std::cout << "   bin " << ib << " (label " << catClone->getLabel() << ") has no pdf" << std::endl;
+        }
+    }   
+
+     
+    if (verb) {
+            CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form(
+	    "SimNLL created with %d channels, %d generic constraints, %d fast gaussian constraints, %d fast poisson constraints, %d fast group constraints.",
+	    (int)nchannels, (int)constrainPdfs_.size(),(int)constrainPdfsFast_.size(),(int)constrainPdfsFastPoisson_.size(),(int)constrainPdfGroups_.size())),__func__);
+    }
+    setValueDirty();
+}
+
+Double_t 
+cacheutils::CachingSimNLL::evaluate() const 
+{
+    // LAUNCH_FUNCTION_TIMER(__timer__, __token__)
+    TRACE_POINT(params_)
+#ifdef TRACE_NLL_EVAL_COUNT
+    ::CachingSimNLLEvalCount++;
+#endif
+#ifdef DEBUG_CACHE
+    PerfCounter::add("CachingSimNLL::evaluate called");
+#endif
+
+    // The very first thing we do before any evaluation: run the analytical
+    // minimization of Barlow-Beeston nuisance parameters.
+    for (size_t i = 0; i < pdfs_.size(); ++i) {
+      if (!pdfs_[i])
+        continue;
+      if (!channelMasks_.empty() && channelMasks_[i]->getVal() != 0.)
+        continue;
+      pdfs_[i]->runAnalyticBarlowBeeston();
+    }
+
+    static bool gentleNegativePenalty_ = runtimedef::get("GENTLE_LEE");
+    DefaultAccumulator<double> ret = 0;
+    for (std::size_t idx = 0; idx < pdfs_.size(); ++idx) {
+        if (pdfs_[idx]) {
+            if (!channelMasks_.empty() && channelMasks_[idx]->getVal() != 0.) {
+                // std::cout << "Channel " << pdfs_[idx]->GetName() << " will be masked as " 
+                //     << channelMasks_[idx]->GetName() << " evalutes to " 
+                //     << channelMasks_[idx]->getVal() << "\n";
+                continue;
+            }
+            if (!internalMasks_.empty() && !internalMasks_[idx]) {
+                continue;
+            }
+            double nllval = pdfs_[idx]->getVal();
+            // what sanity check could I put here?
+            ret += nllval;
+        }
+    }
+    if (!constrainPdfs_.empty() || !constrainPdfsFast_.empty() || !constrainPdfsFastPoisson_.empty() || !constrainPdfGroups_.empty()) {
+        DefaultAccumulator<double> ret2 = 0;
+        /// ============= GENERIC CONSTRAINTS  =========
+        for (std::size_t i = 0; i < constrainPdfs_.size(); ++i) {
+            double pdfval = constrainPdfs_[i]->getVal(nuis_);
+            if (!std::isnormal(pdfval) || pdfval <= 0) {
+                //std::cout << "WARNING: underflow constraint pdf " << constrainPdfs_[i]->GetName() << ", value = " << pdfval << std::endl;
+    		    CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("underflow (pdf evaluates to <=0) of constraint pdf %s, value = %g ",constrainPdfs_[i]->GetName(), pdfval)),__func__);
+                if (gentleNegativePenalty_) { ret += 25; continue; }
+                if (!noDeepLEE_) logEvalError((std::string("Constraint pdf ")+constrainPdfs_[i]->GetName()+" evaluated to zero, negative or error").c_str());
+                pdfval = 1e-9;
+            }
+            ret2 += std::log(pdfval) + constrainZeroPoints_[i];
+        }
+        if (!constrainPdfGroups_.empty()) {
+            for (const SimpleConstraintGroup & g : constrainPdfGroups_) {
+                ret2 += g.getVal();
+            }
+        } else {
+            /// ============= FAST GAUSSIAN CONSTRAINTS  =========
+            for (std::size_t i = 0; i < constrainPdfsFast_.size(); ++i) {
+                ret2 += constrainPdfsFast_[i]->getLogValFast() + constrainZeroPointsFast_[i];
+            }
+            /// ============= FAST POISSON CONSTRAINTS  =========
+            for (std::size_t i = 0; i < constrainPdfsFastPoisson_.size(); ++i) {
+                ret2 += constrainPdfsFastPoisson_[i]->getLogValFast() + constrainZeroPointsFastPoisson_[i];
+            }
+        }
+        ret -= ret2.sum();
+    }
+    ret += (maskingOffset_ - maskingOffsetZero_);
+#ifdef TRACE_NLL_EVALS
+    static unsigned long _trace_ = 0; _trace_++;
+    if (_trace_ % 10 == 0)  { putchar('.'); fflush(stdout); }
+    //if (_trace_ % 250 == 0) { printf("               NLL % 10.4f after %10lu evals.\n", ret.sum(), _trace_); fflush(stdout); }
+#endif
+    TRACE_NLL("SimNLL for " << GetName() << ": " << ret.sum())
+    return ret.sum();
+}
+
+bool
+cacheutils::CachingSimNLL::setData(RooAbsData &data, bool cloneData)
+{
+    dataOriginal_ = &data;
+    //std::cout << "combined data has " << data.numEntries() << " dataset entries (sumw " << data.sumEntries() << ", weighted " << data.isWeighted() << ")" << std::endl;
+    //utils::printRAD(&data);
+    //dataSets_.reset(dataOriginal_->split(pdfOriginal_->indexCat(), true));
+    if (!(RooCategory*)data.get()->find("CMS_channel")) { 
+    	throw  std::logic_error("Error: no category in dataset. You should try to recreate your datacard as a Fake shape datacard -- combineCards.py mycard.txt -S > myshapecard.txt OR rerun with option --forceRecreateNLL");
+	assert(0);
+    }
+    splitWithWeights(*dataOriginal_, pdfOriginal_->indexCat(), true);
+    for (int ib = 0, nb = pdfs_.size(); ib < nb; ++ib) {
+        CachingAddNLL *canll = pdfs_[ib];
+        if (canll == 0) continue;
+        RooAbsData *data = datasets_[ib];
+        //RooAbsData *data = (RooAbsData *) dataSets_->FindObject(canll->GetName());
+        if (data == 0) { throw std::logic_error("Error: no data"); }
+        //std::cout << "   bin " << ib << " (label " << canll->GetName() << ") has pdf " << canll->pdf()->GetName() << " of type " << canll->pdf()->ClassName() <<
+        //             " and " << (data ? data->numEntries() : -1) << " dataset entries (sumw " << data->sumEntries() << ", weighted " << data->isWeighted() << ")" << std::endl;
+        canll->setData(*data);
+    }
+    return true;
+}
+
+void cacheutils::CachingSimNLL::splitWithWeights(const RooAbsData &data, const RooAbsCategory& splitCat, Bool_t createEmptyDataSets) {
+    RooCategory *cat = dynamic_cast<RooCategory *>(data.get()->find(splitCat.GetName()));
+    if (cat == 0) throw std::logic_error("Error: no category");
+    std::unique_ptr<RooAbsCategoryLValue> catClone((RooAbsCategoryLValue*) splitCat.Clone());
+    int nb = cat->numBins((const char *)0), ne = data.numEntries();
+    RooArgSet obs(*data.get()); obs.remove(*cat, true, true);
+    RooRealVar weight("_weight_","",1);
+    RooArgSet obsplus(obs); obsplus.add(weight);
+    if (nb != int(datasets_.size())) throw std::logic_error("Number of categories changed"); // this can happen due to bugs in RooDataSet
+    std::vector<int> includeZeroWeights(nb,0); bool includeZeroWeightsAny = false;
+    if (runtimedef::get("ADDNLL_ROOREALSUM_BASICINT") && runtimedef::get("ADDNLL_ROOREALSUM_KEEPZEROS") && factorizedPdf_.get()) {
+        for (int ib = 0; ib < nb; ++ib) {
+            catClone->setBin(ib);
+            RooAbsPdf *pdf = factorizedPdf_->getPdf(catClone->getLabel());
+            if (dynamic_cast<RooRealSumPdf*>(pdf)!=0) {
+                includeZeroWeights[ib] = 1;
+                includeZeroWeightsAny = true;
+            }
+        }
+    }
+    for (int ib = 0; ib < nb; ++ib) {
+        if (datasets_[ib] == 0) {
+            catClone->setBin(ib);
+            RooAbsPdf *pdf = pdfOriginal_->getPdf(catClone->getLabel());
+            if (pdf) {
+                std::unique_ptr<RooArgSet> myobs(pdf->getObservables(obs));
+                myobs->add(weight);
+                //std::cout << "Observables for bin " << ib << ":"; myobs->Print("");
+                datasets_[ib] = new RooDataSet("", "", *myobs, RooFit::WeightVar("_weight_"));
+            } else {
+                datasets_[ib] = new RooDataSet("", "", obsplus, RooFit::WeightVar("_weight_"));
+            }
+        } else {
+            datasets_[ib]->reset();
+        }
+    }
+    //utils::printRDH((RooAbsData*)&data);
+    for (int i = 0; i < ne; ++i) {
+        data.get(i); if (data.weight() == 0 && !includeZeroWeightsAny) continue;
+        int ib = cat->getBin((const char*) 0);
+        //std::cout << "Event " << i << " of weight " << data.weight() << " is in bin " << ib << " label " << cat->getLabel() << std::endl;
+        if (data.weight() > 0 || includeZeroWeights[ib]) datasets_[ib]->add(obs, data.weight());
+    }
+}
+
+void cacheutils::CachingSimNLL::setZeroPoint() {
+    for (auto& pdf : pdfs_) {
+        if (pdf) pdf->setZeroPoint();
+    }
+    for (std::size_t i = 0; i < constrainPdfs_.size(); ++i) {
+        double pdfval = constrainPdfs_[i]->getVal(nuis_);
+        if (std::isnormal(pdfval) || pdfval > 0) constrainZeroPoints_[i] = -std::log(pdfval);
+    }
+    for (std::size_t i = 0; i < constrainPdfsFast_.size(); ++i) {
+        constrainZeroPointsFast_[i] = -constrainPdfsFast_[i]->getLogValFast();
+    }
+    for (std::size_t i = 0; i < constrainPdfsFastPoisson_.size(); ++i) {
+        constrainZeroPointsFastPoisson_[i] = -constrainPdfsFastPoisson_[i]->getLogValFast();
+    }
+    for (SimpleConstraintGroup & g : constrainPdfGroups_) {
+        g.setZeroPoint();
+    }
+    maskingOffsetZero_ = maskingOffset_;
+    setValueDirty();
+}
+
+void cacheutils::CachingSimNLL::clearZeroPoint() {
+    for (auto& pdf : pdfs_) {
+        if (pdf) pdf->clearZeroPoint();
+    }
+    std::fill(constrainZeroPoints_.begin(), constrainZeroPoints_.end(), 0.0);
+    std::fill(constrainZeroPointsFast_.begin(), constrainZeroPointsFast_.end(), 0.0);
+    std::fill(constrainZeroPointsFastPoisson_.begin(), constrainZeroPointsFastPoisson_.end(), 0.0);
+    for (SimpleConstraintGroup & g : constrainPdfGroups_) g.clearZeroPoint();
+    maskingOffsetZero_ = 0;
+    setValueDirty();
+}
+
+void cacheutils::CachingSimNLL::clearConstantZeroPoint() {
+    for (auto const& it : pdfs_) {
+        if (it) it->clearConstantZeroPoint();
+    }
+    setValueDirty();
+}
+
+void cacheutils::CachingSimNLL::setChannelMasks(const RooArgList &args) {
+    // Here we're assuming that args has the same size and is aligned with
+    // the vector of pdfs. This should be ok because RooSimultaneousOpt does
+    // the validation when it is first given the RooArgList of masking terms,
+    // but maybe we should check here too?
+    std::vector<RooAbsReal *> vars;
+    for (int i = 0; i < args.getSize(); ++i) {
+        RooAbsReal *var = dynamic_cast<RooAbsReal*>(args.at(i));
+        if (!var) return;
+        vars.push_back(var);
+    }
+    channelMasks_ = vars;
+}
+
+void cacheutils::CachingSimNLL::setAnalyticBarlowBeeston(bool flag) {
+   /*
+      if (flag) {
+        printf(">> Enabling analytic minimisation of bin-wise statistical uncertainty parameters\n");
+      } else {
+        printf(">> Disabling analytic minimisation of bin-wise statistical uncertainty parameters\n");
+      }
+    */
+    for (int ib = 0, nb = pdfs_.size(); ib < nb; ++ib) {
+        // If channel is masked we must always make sure analytic minimisation is off
+        if (!channelMasks_.empty() && channelMasks_[ib]->getVal() != 0.) {
+            pdfs_[ib]->setAnalyticBarlowBeeston(false);
+        } else {
+            pdfs_[ib]->setAnalyticBarlowBeeston(flag);
+
+        }
+    }
+}
+
+// ROOT 6.26 changed the signature of getParameters to avoid heap allocation,
+// and especially returning an owning pointer that people tend to forget to
+// delete.
+#if ROOT_VERSION_CODE < ROOT_VERSION(6,26,0)
+RooArgSet* 
+cacheutils::CachingSimNLL::getParameters(const RooArgSet* depList, Bool_t stripDisconnected) const 
+{
+    RooArgSet *ret;
+    if (internalMasks_.empty()) {
+        ret = new RooArgSet(params_); 
+        ret->add(catParams_);
+    } else {
+        ret = new RooArgSet(activeParameters_); 
+        ret->add(activeCatParameters_);
+    }
+    return ret;
+}
+#else
+bool cacheutils::CachingSimNLL::getParameters(const RooArgSet* depList,
+                                              RooArgSet& outputSet,
+                                              bool stripDisconnected) const
+{
+    if (internalMasks_.empty()) {
+        outputSet.add(params_);
+        outputSet.add(catParams_);
+    } else {
+        outputSet.add(activeParameters_);
+        outputSet.add(activeCatParameters_);
+    }
+    return true;
+}
+#endif
+
+void cacheutils::CachingSimNLL::setMaskNonDiscreteChannels(bool mask) {
+    double nllBefore = evaluate();
+    internalMasks_.clear(); // reset
+    activeParameters_.removeAll(); 
+    activeCatParameters_.removeAll();
+    if (mask) {
+        internalMasks_.resize(pdfs_.size(), false);
+        for (std::size_t idx = 0; idx < pdfs_.size(); ++idx) {
+            if (!pdfs_[idx]) continue;
+            for (RooAbsArg *P : pdfs_[idx]->catParams()) {
+                RooCategory *cat = dynamic_cast<RooCategory *>(P);
+                if (!cat) continue;
+                if (cat && !cat->isConstant()) {
+                    internalMasks_[idx] = true; 
+                    activeParameters_.add(pdfs_[idx]->params(), /*silent=*/true); 
+                    activeCatParameters_.add(pdfs_[idx]->catParams(), /*silent=*/true); 
+                    CombineLogger::instance().log("CachingNLL.cc",__LINE__,std::string(Form("Enabling channel %s that depends on non-constant category %s",pdfs_[idx]->GetName(), cat->GetName())),__func__);
+                    break;
+                }
+            }
+        }
+    }
+    double nllAfter = evaluate();
+    maskingOffset_ += (nllBefore - nllAfter);
+    //printf("CachingSimNLL: setMaskNonDiscreteChannels(%d): nll before %.12g, nll after %.12g (diff %.12g), new maskingOffset %.12g, check = %.12g\n",
+    //            int(mask), nllBefore, nllAfter, (nllBefore-nllAfter), maskingOffset_, evaluate() - nllBefore);
+}

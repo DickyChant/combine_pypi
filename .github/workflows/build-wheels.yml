@@ -1,0 +1,75 @@
+name: build wheels
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-wheel:
+    name: manylinux 2.28 x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install wheel builder
+        run: python -m pip install cibuildwheel==4.1.1
+
+      - name: Build and test wheel in manylinux
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Verify wheel contents and runtime paths
+        run: python scripts/verify_wheel.py wheelhouse/higgs_combine_tool-11.0.0-*.whl
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: higgs-combine-tool-wheel
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  cross-python-smoke:
+    name: smoke test Python ${{ matrix.python-version }}
+    needs: build-linux-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: higgs-combine-tool-wheel
+          path: wheelhouse
+
+      - name: Create isolated test virtualenv
+        run: |
+          python -m pip install virtualenv
+          python -m virtualenv .venv-test
+
+      - name: Install wheel and run a blind fit
+        run: |
+          .venv-test/bin/python -m pip install wheelhouse/higgs_combine_tool-11.0.0-*.whl
+          PATH="$PWD/.venv-test/bin:$PATH" .venv-test/bin/python tests/smoke_test.py

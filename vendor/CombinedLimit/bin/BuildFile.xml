@@ -1,0 +1,8 @@
+<bin file="combine.cpp" name="combine">
+  <use name="HiggsAnalysis/CombinedLimit"/>
+  <use   name="boost_program_options"/>
+</bin>
+<bin file="PerfTest.cpp" name="PerfTest">
+  <use name="HiggsAnalysis/CombinedLimit"/>
+  <use   name="boost_program_options"/>
+</bin>

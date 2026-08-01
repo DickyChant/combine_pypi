@@ -1,0 +1,11 @@
+.venv*/
+.cache/
+build/
+dist/
+wheelhouse/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.root
+combine_logger.out
+.pytest_cache/
