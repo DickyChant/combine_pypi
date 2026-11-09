@@ -32,7 +32,7 @@ jobs:
         run: python -m cibuildwheel --output-dir wheelhouse
 
       - name: Verify wheel contents and runtime paths
-        run: python scripts/verify_wheel.py wheelhouse/higgs_combine_tool-11.0.0-*.whl
+        run: python scripts/verify_wheel.py wheelhouse/higgs_combine_tool-11.0.0.post1-*.whl
 
       - uses: actions/upload-artifact@v6
         with:
@@ -71,5 +71,5 @@ jobs:
 
       - name: Install wheel and run a blind fit
         run: |
-          .venv-test/bin/python -m pip install wheelhouse/higgs_combine_tool-11.0.0-*.whl
+          .venv-test/bin/python -m pip install wheelhouse/higgs_combine_tool-11.0.0.post1-*.whl
           PATH="$PWD/.venv-test/bin:$PATH" .venv-test/bin/python tests/smoke_test.py
