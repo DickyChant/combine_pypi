@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # The base branch (main), also for pull_request_target.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Compare vendored versions with upstream
         env:
           GH_TOKEN: ${{ github.token }}
