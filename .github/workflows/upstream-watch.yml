@@ -1,0 +1,107 @@
+name: upstream watch
+
+# Dependabot cannot see the vendored Combine source, so this checks it weekly
+# (Tuesday, a day after Dependabot's Monday run): a newer Combine release, or a
+# newer root wheel than the pinned one, opens (or refreshes) one issue per finding.
+# A root update that Dependabot already proposed is left to its PR.
+#
+# On a Dependabot PR that changes the root pin, it instead checks both sides in
+# one PR comment: the new root pin (and whether every root== pin in pyproject.toml
+# moved with it), and whether the vendored Combine is still the latest release.
+# This runs as pull_request_target so it may comment; it never checks out or runs
+# the PR's code, and only reads the PR's pyproject.toml as text through the API.
+on:
+  schedule:
+    - cron: "17 6 * * 2"
+  workflow_dispatch:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+    paths: [pyproject.toml]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  check:
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      # The base branch (main), also for pull_request_target.
+      - uses: actions/checkout@v6
+      - name: Compare vendored versions with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          vendored=$(grep -oP 'tag `\K[^`]+' VENDORED.md | head -1)
+          latest=$(gh api repos/cms-analysis/HiggsAnalysis-CombinedLimit/releases/latest --jq .tag_name)
+          pinned=$(grep -oP 'root==\K[0-9A-Za-z.]+' pyproject.toml | head -1)
+          root_latest=$(curl -fsS https://pypi.org/pypi/root/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')
+          echo "Combine: vendored $vendored, latest release $latest"
+          echo "root: pinned on main $pinned, latest on PyPI $root_latest"
+
+          if [ "$EVENT" = pull_request_target ]; then
+            gh api "repos/$GITHUB_REPOSITORY/contents/pyproject.toml?ref=$HEAD_SHA" -H 'Accept: application/vnd.github.raw' > /tmp/pr_pyproject.toml
+            pr_pins=$(grep -oP 'root==\K[0-9A-Za-z.]+' /tmp/pr_pyproject.toml | sort -u)
+            new=$(grep -xv "$pinned" <<<"$pr_pins" | head -1 || true)
+            if [ -z "$new" ]; then
+              echo "PR #$PR does not change the root pin; nothing to check."
+              exit 0
+            fi
+            body="<!-- upstream-watch -->
+          **upstream watch: root $pinned → $new**
+
+          root
+          - PyPI latest: $root_latest$([ "$new" = "$root_latest" ] && echo ' (this PR)' || echo " — this PR is not the latest")"
+            if [ "$(wc -l <<<"$pr_pins")" -gt 1 ]; then
+              body+="
+          - **Not every root pin moved.** pyproject.toml in this PR still has: $(grep -xv "$new" <<<"$pr_pins" | paste -sd, -). Dependabot does not update the cibuildwheel \`before-build\` command; update all three pins (build-system, dependencies, before-build) together."
+            else
+              body+="
+          - All root pins in pyproject.toml are $new."
+            fi
+            body+="
+
+          Combine
+          - Vendored: $vendored; latest release: $latest."
+            if [ "$vendored" != "$latest" ]; then
+              body+=" **Combine is behind.** Consider re-vendoring $latest in the same update, keeping or dropping the backports listed in VENDORED.md."
+            else
+              body+=" Up to date."
+            fi
+            body+="
+
+          Before merging: the wheel build and smoke tests on this PR must pass, and the Asimov check against CMSSW should be redone for a new ROOT (see VENDORED.md for the variable-binning backport)."
+            comment=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq '[.[] | select(.body | startswith("<!-- upstream-watch -->"))][0].id // empty')
+            if [ -n "$comment" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment" -f body="$body" > /dev/null
+            else
+              gh pr comment "$PR" --body "$body"
+            fi
+            exit 0
+          fi
+
+          report() {
+            title="$1"; body="$2"
+            number=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+            if [ -n "$number" ]; then gh issue comment "$number" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
+          }
+          if [ "$vendored" != "$latest" ]; then
+            report "Combine $latest is released (vendored: $vendored)" \
+              "Upstream released [$latest](https://github.com/cms-analysis/HiggsAnalysis-CombinedLimit/releases/tag/$latest). The wheel vendors $vendored (see VENDORED.md). Check its notes, re-vendor, keep or drop the backports listed in VENDORED.md, and rebuild."
+          fi
+          if [ "$pinned" != "$root_latest" ]; then
+            dependabot_pr=$(gh pr list --state open --author 'app/dependabot' --search 'root in:title' --json number --jq '.[0].number // empty')
+            if [ -n "$dependabot_pr" ]; then
+              echo "root $root_latest: already proposed in Dependabot PR #$dependabot_pr; no issue opened."
+            else
+              report "root $root_latest is on PyPI (pinned: $pinned)" \
+                "PyPI has [root $root_latest](https://pypi.org/project/root/$root_latest/); pyproject.toml pins $pinned. Update all three pins (build-system, dependencies, cibuildwheel before-build), rebuild the wheel and run the smoke tests."
+            fi
+          fi

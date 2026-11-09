@@ -1,0 +1,25 @@
+# Weekly update PRs for the GitHub Actions in the workflows and the pip requirements in
+# pyproject.toml. root is pinned exactly (see README); a root update needs the wheel rebuilt
+# and checked, so its PR is a prompt for that, not an automatic merge.
+# Runs Monday 03:00 UTC, a day before the upstream watcher (Tuesday), so a root update is
+# already an open Dependabot PR when the watcher looks; the watcher then points to that PR
+# instead of opening a second issue for it.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Etc/UTC
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Etc/UTC
