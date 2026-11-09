@@ -22,7 +22,7 @@ Download the `higgs-combine-tool-wheel` artifact from a successful
 python3.13 -m pip install virtualenv
 python3.13 -m virtualenv .venv
 source .venv/bin/activate
-python -m pip install ./higgs_combine_tool-11.0.0-*.whl
+python -m pip install ./higgs_combine_tool-11.0.0.post1-*.whl
 
 combine --help
 text2workspace.py card.txt -o workspace.root
@@ -64,7 +64,11 @@ distribution.
 ## Current support boundary
 
 - Combine source: tag `v11.0.0`, commit
-  `66f59f9a899b143dc95a1d6d866fab5df8850189`.
+  `66f59f9a899b143dc95a1d6d866fab5df8850189`, plus the backported fix of
+  [cms-analysis/HiggsAnalysis-CombinedLimit#1345](https://github.com/cms-analysis/HiggsAnalysis-CombinedLimit/pull/1345)
+  (see [VENDORED.md](VENDORED.md)). Without it, ROOT 6.36+ multiplies every bin of the
+  pre-fit Asimov, the vertical-morphing template caches and the `FitDiagnostics`
+  shapes by the bin width on variable-width binning.
 - ROOT distribution: exactly `root==0.1a12` (ROOT 6.40.00).
 - Platform: CPython 3.10–3.14 on Linux x86-64 with glibc 2.28 or newer.
 - Core CLI, datacard parsing, workspace creation, and native statistical methods
@@ -130,7 +134,7 @@ To produce and repair a wheel instead of using editable mode:
 ```bash
 python -m build --wheel --no-isolation
 python scripts/repair_wheel.py \
-  --wheel dist/higgs_combine_tool-11.0.0-py3-none-linux_x86_64.whl \
+  --wheel dist/higgs_combine_tool-11.0.0.post1-py3-none-linux_x86_64.whl \
   --dest-dir wheelhouse \
   --plat manylinux_2_34_x86_64  # use the policy supported by the local host
 ```
@@ -140,7 +144,7 @@ For a clean end-to-end install test:
 ```bash
 python3.13 -m virtualenv .venv-test
 source .venv-test/bin/activate
-python -m pip install wheelhouse/higgs_combine_tool-11.0.0-*.whl
+python -m pip install wheelhouse/higgs_combine_tool-11.0.0.post1-*.whl
 python tests/smoke_test.py
 ```
 

@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "higgs-combine-tool"
-version = "11.0.0"
+version = "11.0.0.post1"
 description = "Experimental binary wheel for the CMS Higgs Combine tool"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
