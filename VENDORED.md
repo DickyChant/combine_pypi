@@ -25,6 +25,15 @@ Local modification:
   not provide; the component targets are linked directly so their include paths
   and transitive dependencies remain attached.
 
+Backported upstream fix (version `11.0.0.post1`):
+
+- [cms-analysis/HiggsAnalysis-CombinedLimit#1345](https://github.com/cms-analysis/HiggsAnalysis-CombinedLimit/pull/1345),
+  merged into `main` as commits `ea37fee`, `38a1e40` and `f46337c`, cherry-picked onto `v11.0.0`.
+  It changes `src/FitDiagnostics.cc`, `src/ToyMCSamplerOpt.cc` and `src/VerticalInterpHistPdf.cc`
+  so that `createHistogram` is asked for densities (`RooFit::Scaling(false)`). The only
+  conflict was an `#include` line in `VerticalInterpHistPdf.cc`; both includes are kept.
+  The upstream regression test and its datacard are copied to `tests/data/`.
+
 The ROOT-wheel relocation is not a vendored-source change. It is applied only
 to the ephemeral build environment by `scripts/prepare_root.py` after an exact
 distribution-version check.
